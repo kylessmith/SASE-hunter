@@ -14,7 +14,7 @@ Simple Example:
 
 More Complicated Example:
 
-    https://github.com/kylessmith/SASE-hunter/master/example/promoters.bed
+    https://github.com/kylessmith/SASE-hunter/blob/master/example/promoters.bed
 
 NOTE: Most input files are assumed to be *sorted* BED files
 
