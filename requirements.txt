@@ -2,4 +2,3 @@ numpy
 scipy
 pybedtools
 fisher
-bx-python
