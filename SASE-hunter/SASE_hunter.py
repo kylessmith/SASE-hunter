@@ -2,46 +2,20 @@ from random import random
 from collections import defaultdict
 import numpy as np
 from numpy import argsort
-from scipy.stats import chisqprob, binom
-import scipy
+from scipy.stats import chisqprob
 from pybedtools import BedTool, Interval, IntervalFile
 from operator import attrgetter
 import argparse, os, tempfile, fisher
 import sys
-from bx.bbi.bigwig_file import BigWigFile
+#from bx.bbi.bigwig_file import BigWigFile
 
-
-def dependent_combine(pvals, weights):
-    
-    if all(p == "NA" for p in pvals): return np.nan
-    pvals = sorted([p for p in pvals if p != "NA"])
-    
-    et = np.sum(weights[len(pvals)-1])
-    vart = 2*et
-    v = (2*np.power(et,2))/vart
-    c = vart/2/et
-    T = np.sum(scipy.stats.chi2.ppf(1-np.array(pvals), weights[len(pvals)-1]))
-    
-    return chisqprob(T/c, v)
-
-
-def get_weights(number_flanks):
-    
-    p = 0.5
-    total_weights = []
-    
-    for i in xrange(1,number_flanks+1):
-        x = binom(i-1,p)
-        weights = x.pmf(np.arange(0,i))
-        total_weights.append(weights)
-        
-    return total_weights
 
 
 def fisher_combine(pvals):
-    """ combined fisher probability with correction"""
+    """ combined fisher probability with correction
+    Use fdr correction for 25 comparisons using rpy2"""
     if all(p == "NA" for p in pvals): return np.nan
-    pvals = [p for p in pvals if not np.isnan(p)]
+    pvals = [p for p in pvals if p != "NA"]
     if len(pvals) == 1: return pvals[0]
     s = -2 * np.sum(np.log(pvals))
     return chisqprob(s, 2 * len(pvals))
@@ -80,8 +54,7 @@ def shuff(n_total_variants, n_shuffles, total_size, select_size):
     n_shuffles: number of shuffles to perform
     total_size: the total region size to consider (46kb
     select_size: the region-size of interest
-
-    returns: a list of tuples of length n_shuffles where each tuple
+    returns: a list of tuples of lenght n_shuffles where each tuple
              contains (n_in_region, n_out_region) for that shuffle.
              likely, this will be used for the null distribution.
     """
@@ -132,7 +105,7 @@ def fisher_compare(var_in_region, var_in_flanks, region_size, total_size,
 
 
 def analyze_intervals(include_file, seed_variants, variant_intervals,
-        flank_regions, test, n_shuffles, out_file, full_format,
+        left_distance, right_distance, test, n_shuffles, out_file, full_format,
         score=None):
     '''
     calculate p-value of obs in seed vs expected from flanks.
@@ -141,21 +114,21 @@ def analyze_intervals(include_file, seed_variants, variant_intervals,
     out = open(out_file, 'w') if isinstance(out_file, basestring) else out_file
 
     # flanks is a generator
-    flankiter = get_flanks(include_file, seed_variants, flank_regions)
-    fmt = "{chrom}\t{start}\t{end}\t{total_flank_bases}\t{seed_bases}\t{n_samples}\t{info}"
+    flankiter = get_flanks(include_file, seed_variants, left_distance,
+                        right_distance)
+    fmt = "{chrom}\t{start}\t{end}\t{flank_bases}\t{seed_bases}\t{n_samples}\t{info}"
     if full_format:
-        fmt += "\t{sample}\t{seed_mutations}\t{total_flank_mutations}"
+        fmt += "\t{sample}\t{seed_mutations}\t{flank_mutations}"
     if test in ("fisher", "both"):
-        fmt += "\t{fisher}\t{sig}:{unsig}"
+        fmt += "\t{fisher}\t{sig}:{total_analyzed}"
     if test in ("permutation", "both"):
         fmt += "\t{permutation}"
     fmt += "\n"
 
     out.write(fmt.replace("{", "").replace("}", ""))
-    weights = get_weights(len(flank_regions))
 
     NA = dict(fisher="NA", permutation="NA", sample="NA", score="NA")
-    for total_flanks, seed_hits, orig_seed in flankiter:
+    for flank_hits, seed_hits, total_bases, orig_seed in flankiter:
         sig = 0
         seen = set()
         variants_in_seed_by_sample = defaultdict(list)
@@ -168,88 +141,86 @@ def analyze_intervals(include_file, seed_variants, variant_intervals,
             # for each sample, track the variants in flanks
             for variant in variants_in_seed:
                 variants_in_seed_by_sample[variant[3]].append(variant)
-        
+
+        variants_in_flanks_by_sample = defaultdict(list)
+
+        # since the same (multi-nucleotide) variant could overlap multiple
+        # we use set() so we dont double-count
+        seen = set()
+        for interval in flank_hits:
+            interval.file_type = "bed"
+            variants_in_flanks = [x for x in
+                    variant_intervals.all_hits(interval) if not x in seen]
+            seen.update(variants_in_flanks)
+            # for each sample, track the variants in flanks
+            for variant in variants_in_flanks:
+                variants_in_flanks_by_sample[variant[3]].append(variant)
+
+        samples = set((variants_in_flanks_by_sample.keys() \
+                       + variants_in_seed_by_sample.keys()))
         n_samples = len(variants_in_seed_by_sample.keys())
-        pvals = []
-        sample_pvals = defaultdict(lambda : defaultdict(list))
-        total_flank_bases = []
-        total_flank_mutations = defaultdict(list)
+        if int(total_bases) > seed_length and len(samples) != 0:
+            pvals = []
+            # for all samples in the seed, see how many variants are in flank
+            # from that sample, throw to analyze function and get pvalue
+            if score is not None:
+                seed_scores = np.hstack([
+                    score.get_as_array(s.chrom, s.start, s.end) for s in
+                    seed_hits])
+                flank_scores = np.hstack([
+                    score.get_as_array(f.chrom, f.start, f.end) for f in
+                        flank_hits ])
 
-        for flank_hits in total_flanks:
-            # since the same (multi-nucleotide) variant could overlap multiple
-            # we use set() so we dont double-count
-            total_bases = sum(i.length for i in flank_hits) + \
-                            sum(i.length for i in seed_hits)
-            total_flank_bases.append(str(total_bases - seed_length))
-            
-            seen = set()
-            variants_in_flanks_by_sample = defaultdict(list)
-            for interval in flank_hits:
-                interval.file_type = "bed"
-                variants_in_flanks = [x for x in
-                        variant_intervals.all_hits(interval) if not x in seen]
-                seen.update(variants_in_flanks)
-                # for each sample, track the variants in flanks
-                for variant in variants_in_flanks:
-                    variants_in_flanks_by_sample[variant[3]].append(variant)
-                    
-            samples = set((variants_in_flanks_by_sample.keys() \
-                           + variants_in_seed_by_sample.keys()))
-            
-            if int(total_bases) > seed_length and len(samples) != 0:
-                for sample in samples:
-                    total_variants = len(variants_in_seed_by_sample[sample]) + \
-                                     len(variants_in_flanks_by_sample[sample])
-                    total_flank_mutations[sample].append(str(len(variants_in_flanks_by_sample[sample])))
-                                 
-                    if total_variants < 2:
-                        sample_pvals[sample]["fisher"].append("NA")
-                        sample_pvals[sample]["permutation"].append("NA")
-                    else:
-                        p = fisher_compare(
-                              len(variants_in_seed_by_sample[sample]),
-                              len(variants_in_flanks_by_sample[sample]),
-                              seed_length, total_bases, n_shuffles, test)
-                        if test in ("fisher","both"):
-                            sample_pvals[sample]["fisher"].append(p["fisher"])
-                        if test in ("permutation","both"):
-                            sample_pvals[sample]["permutation"].append(p["permutation"])
+            for sample in samples:
+                total_variants = len(variants_in_seed_by_sample[sample]) + \
+                                 len(variants_in_flanks_by_sample[sample])
+                if score is not None:
+                    # will need the actual variants, not just the counts.
 
-                    #pvals[-1]['sample'] = sample
-                #assert pvals, (pvals, samples)
-            else:
-                pass
+                    vs = variants_in_seed_by_sample[sample]
+                    # get returns [(start, end, value)]
+                    obs_sum_in_region = sum(score.get(v.chrom,
+                                                      v.start,
+                                                      v.end)[0][2] for v in vs)
+
+                    vsf = variants_in_flanks_by_sample[sample]
+                    if len(vs) + len(vsf) < 3 or len(vsf) < 1:
+                        pvals.append(NA.copy())
+                        continue
+                    obs_sum_in_flanks = sum(score.get(v.chrom,
+                                                      v.start,
+                                                      v.end)[0][2] for v in vsf)
+
+                    pvals.append(sim_score(
+                        len(variants_in_seed_by_sample[sample]),
+                        len(variants_in_flanks_by_sample[sample]),
+                        n_shuffles,
+                        seed_scores, flank_scores,
+                        obs_sum_in_region, obs_sum_in_flanks))
+                elif total_variants < 2:
+                    pvals.append(NA.copy())
+                else:
+                    p = fisher_compare(
+                          len(variants_in_seed_by_sample[sample]),
+                          len(variants_in_flanks_by_sample[sample]),
+                          seed_length, total_bases, n_shuffles, test)
+                    if p['fisher'] <= 0.05: sig += 1
+                    pvals.append(p)
+
+                pvals[-1]['sample'] = sample
+            assert pvals, (pvals, samples)
+        else:
+            pvals = [NA.copy()]
             
-        pvals = []
-        for sample in sample_pvals:
-            if test == "fisher":
-                fishers_pval = dependent_combine(sample_pvals[sample]["fisher"], weights)
-                pvals.append({"fisher":fishers_pval, "sample":sample})
-                if fishers_pval <= 0.05: sig += 1
-            elif test =="permutation":
-                permutation_pval = dependent_combine(sample_pvals[sample]["permutation"], weights)
-                pvals.append({"permutation":permutation_pval, "sample":sample})
-            elif test =="both":
-                permutation_pval = dependent_combine(sample_pvals[sample]["permutation"], weights)
-                fishers_pval = dependent_combine(sample_pvals[sample]["fisher"], weights)
-                pvals.append({"fisher":fishers_pval,"permutation":permutation_pval, "sample":sample})
-                    
-        #print sample_pvals
-        #print pvals
-        #print "|".join(total_flank_bases)
-        #print sig, ":", len(samples)
-        #print [p['fisher'] for p in pvals]
-        #exit()
-        
         idict = dict(chrom=orig_seed.chrom, start=orig_seed.start,
                      end=orig_seed.end, n_samples=n_samples,
-                     info=orig_seed[3], total_flank_bases="|".join(total_flank_bases),
-                     seed_bases=seed_length, sig=sig, unsig=len(samples))
+                     info=orig_seed[3], flank_bases=total_bases - seed_length,
+                     seed_bases=seed_length, sig=sig, total_analyzed=len(samples))
         if full_format:
             for pdict in pvals:
                 idict.update(dict(
                   seed_mutations=len(variants_in_seed_by_sample[pdict['sample']]),
-                  total_flank_mutations="|".join(total_flank_mutations[pdict['sample']])
+                  flank_mutations=len(variants_in_flanks_by_sample[pdict['sample']])
                 ))
                 idict.update(pdict)
                 out.write(fmt.format(**idict))
@@ -259,13 +230,14 @@ def analyze_intervals(include_file, seed_variants, variant_intervals,
             if test in ("permutations", "both"):
                 idict['permutation'] = fisher_combine([p['permutation'] for p
                     in pvals])
-
+            if score:
+                idict['score'] = fisher_combine([p['score'] for p in pvals])
             out.write(fmt.format(**idict))
 
     return out.name
 
 
-def get_flanks(include_file, seeds, flank_regions):
+def get_flanks(include_file, seeds, up_distance, down_distance):
 
     # .intervals returns the tree
     include = include_file.intervals
@@ -283,63 +255,59 @@ def get_flanks(include_file, seeds, flank_regions):
         # and either continue or yield None?
         if seed_hits == []: continue
         seed_hits = sorted(seed_hits, key=attrgetter('start'))
-        total_flanks = []
-        
-        for up_distance, down_distance in flank_regions:
-        
-            if seed.strand == "-":
-                region_left = Interval(seed.chrom, max(0,seed.start - down_distance), seed.start)
-                region_right = Interval(seed.chrom, seed.end, seed.end + up_distance)
-            else:
-                region_left = Interval(seed.chrom, max(0,seed.start - up_distance), seed.start)
-                region_right = Interval(seed.chrom, seed.end, seed.end + down_distance)
-            # this is needed, unfortunately
-            region_right.file_type = region_left.file_type = "bed"
 
-            # this won't handle overlapping include intervals...
-            include_left = sorted(include.all_hits(region_left), key=attrgetter('start'))
-            include_right = sorted(include.all_hits(region_right), key=attrgetter('start'))
+        if seed.strand == "-":
+            region_left = Interval(seed.chrom, max(0,seed.start - down_distance), seed.start)
+            region_right = Interval(seed.chrom, seed.end, seed.end + up_distance)
+        else:
+            region_left = Interval(seed.chrom, max(0,seed.start - up_distance), seed.start)
+            region_right = Interval(seed.chrom, seed.end, seed.end + down_distance)
+        # this is needed, unfortunately
+        region_right.file_type = region_left.file_type = "bed"
 
-            #assert bad_cov(include_right) == sum(i.length for i in include_right)
-            #assert bad_cov(include_left) == sum(i.length for i in include_left)
+        # this won't handle overlapping include intervals...
+        include_left = sorted(include.all_hits(region_left), key=attrgetter('start'))
+        include_right = sorted(include.all_hits(region_right), key=attrgetter('start'))
 
-            if include_left:
-                # truncate to not include the seed point so we get unique for left, right
-                # and add in the seed at the end
-                include_left[-1].end = min(include_left[-1].end, seed.start)
-                # adjust end-point so we get exactly pad
-                include_left[0].start = max(include_left[0].start, region_left.start)
+        #assert bad_cov(include_right) == sum(i.length for i in include_right)
+        #assert bad_cov(include_left) == sum(i.length for i in include_left)
 
-            if include_right:
-                # truncate to region
-                include_right[0].start = max(include_right[0].start, seed.end)
-                include_right[-1].end = min(include_right[-1].end, region_right.end)
+        if include_left:
+            # truncate to not include the seed point so we get unique for left, right
+            # and add in the seed at the end
+            include_left[-1].end = min(include_left[-1].end, seed.start)
+            # adjust end-point so we get exactly pad
+            include_left[0].start = max(include_left[0].start, region_left.start)
 
-            #assert bad_cov(include_right) == sum(i.length for i in include_right)
-            #assert bad_cov(include_left) == sum(i.length for i in include_left)
+        if include_right:
+            # truncate to region
+            include_right[0].start = max(include_right[0].start, seed.end)
+            include_right[-1].end = min(include_right[-1].end, region_right.end)
 
-            assert include_left == [] or include_left[-1].end <= seed.start
-            assert include_right == [] or seed.end <= include_right[0].start
+        #assert bad_cov(include_right) == sum(i.length for i in include_right)
+        #assert bad_cov(include_left) == sum(i.length for i in include_left)
 
-            #null_bases = total_bases - l
+        assert include_left == [] or include_left[-1].end <= seed.start
+        assert include_right == [] or seed.end <= include_right[0].start
 
-            #assert bad_cov(include_left) == sum(i.length for i in include_left)
-            #assert bad_cov(include_right) == sum(i.length for i in include_right)
-            #assert bad_cov(seed_hits) == sum(i.length for i in seed_hits)
-            flanks = include_left + include_right
-            total_flanks.append(flanks)
-        
+        #null_bases = total_bases - l
+
+        #assert bad_cov(include_left) == sum(i.length for i in include_left)
+        #assert bad_cov(include_right) == sum(i.length for i in include_right)
+        #assert bad_cov(seed_hits) == sum(i.length for i in seed_hits)
+
         # truncate seed_hits to actual seed region
         seed_hits[0].start = max(seed_hits[0].start, seed.start)
         seed_hits[-1].end = min(seed_hits[-1].end, seed.end)
 
         #assert bad_cov(seed_hits) == sum(i.length for i in seed_hits)
 
-        ##total_bases = sum(i.length for i in flanks) + sum(i.length for i in
-                ##seed_hits)
+        flanks = include_left + include_right
+        total_bases = sum(i.length for i in flanks) + sum(i.length for i in
+                seed_hits)
         #coverage = bad_cov(flanks)
         #assert coverage == total_bases
-        yield total_flanks, seed_hits, seed
+        yield flanks, seed_hits, total_bases, seed
 
 def bed_generator(in_vcfs, prefix="chr", filter=True, qual_min=1):
 
@@ -380,9 +348,9 @@ def main():
     parser=argparse.ArgumentParser()
 
     parser.add_argument('--upstream', type=int, help='distance upstream of seed'
-            ' to look for flanking regions to compare with `seed`, default = 20000', default=20000, nargs='+')
+            ' to look for flanking regions to compare with `seed`, default = 20000', default=20000)
     parser.add_argument('--downstream', type=int, help='distance downstream to '
-            'look for flanking regions, default = 20000', default=20000, nargs='+')
+            'look for flanking regions, default = 20000', default=20000)
     parser.add_argument('--seed', help='regions of interest, e.g. promoters',
             required=True, metavar="BED")
 
@@ -393,14 +361,13 @@ def main():
     parser.add_argument('--genome', help='the name of the genome file for BEDTools')
     parser.add_argument('--full', help='output full, dataset with per-sample p-values',
             default=False, action='store_true')
-    parser.add_argument('--score', metavar="BIGWIG/INT", help='')
+    #parser.add_argument('--score', metavar="BIGWIG/INT", help='')
     parser.add_argument('variants', help='regions to assign significance e.g.'
             'a list of variants', metavar="BED/VCF", nargs='+')
 
     args=parser.parse_args()
-    
+
     seed_region = BedTool(args.seed)
-    flank_regions = zip(args.upstream, args.downstream)
 
     if args.variants[0][-4:] == '.vcf':
         region_file = vcf_to_long_bed(*args.variants)
@@ -422,8 +389,9 @@ def main():
     if args.score:
         bw = BigWigFile(open(args.score))
 
-    analyze_intervals(include_file, seed_region, region_file, flank_regions,
-                        args.test, args.shuffles, out_file, args.full,score=bw)
-                        
+    analyze_intervals(include_file, seed_region, region_file, args.upstream,
+            args.downstream, args.test, args.shuffles, out_file, args.full,
+            score=bw)
+
 if __name__=='__main__':
     main()
