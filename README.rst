@@ -76,6 +76,10 @@ downstream.
 Installation
 ============
 
+pip can be used to install by::
+
+    pip install SASE_hunter
+
 If you dont already have numpy and scipy installed, it is best to download
 `Anaconda`, a python distribution that has them included.  
 
