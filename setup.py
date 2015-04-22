@@ -7,7 +7,7 @@ the near-by regions. '''
 
 setup(
     name="SASE_hunter",
-    version="0.1",
+    version="0.1.1",
     packages=["SASE_hunter"],
     author="Kyle S. Smith, Brent Pedersen",
     license="MIT Licenses",
