@@ -361,7 +361,7 @@ def main():
     parser.add_argument('--genome', help='the name of the genome file for BEDTools')
     parser.add_argument('--full', help='output full, dataset with per-sample p-values',
             default=False, action='store_true')
-    parser.add_argument('--score', metavar="BIGWIG/INT", help='')
+    parser.add_argument('--score', metavar="BIGWIG/INT", help='score functionality in progress')
     parser.add_argument('variants', help='regions to assign significance e.g.'
             'a list of variants', metavar="BED/VCF", nargs='+')
 
