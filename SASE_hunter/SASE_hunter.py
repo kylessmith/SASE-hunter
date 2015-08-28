@@ -96,7 +96,7 @@ def fisher_compare(var_in_region, var_in_flanks, region_size, total_size,
        record['fisher'] = pvalue.right_tail
 
    if test in ('permutation', "both"):
-       r = shuff(var_total, n_shuffles=n_shuffles,total_size=total_size,
+       r = shuff(var_in_region+var_in_flanks, n_shuffles=n_shuffles,total_size=total_size,
                  select_size=region_size)
        r_pvalue = sum(sim_in_region >= var_in_region for sim_in_region,
                       sim_out_region in r) / float(n_shuffles)
@@ -204,7 +204,10 @@ def analyze_intervals(include_file, seed_variants, variant_intervals,
                           len(variants_in_seed_by_sample[sample]),
                           len(variants_in_flanks_by_sample[sample]),
                           seed_length, total_bases, n_shuffles, test)
-                    if p['fisher'] <= 0.05: sig += 1
+                    if test in ('permutation', "both"):
+                        if p['permutation'] <= 0.05: sig += 1
+                    if test in ('fisher', "both"):
+                        if p['fisher'] <= 0.05: sig += 1
                     pvals.append(p)
 
                 pvals[-1]['sample'] = sample
